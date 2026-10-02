@@ -10,8 +10,6 @@ setup(
             "mot.inspect_tensors = mot.inspect_tensors:main",
         ],
     },
-    extras_require={
-        "hub": ["huggingface_hub"],
-    },
+    install_requires=["huggingface_hub"],
     python_requires=">=3.9",
 )
