@@ -8,12 +8,19 @@ merged together.
 
 Only each file's JSON header is read; the tensor data (often tens of GB) is
 never touched, so this stays fast even for very large models.
+
+The model may be a local directory of *.safetensors files (with or without a
+model.safetensors.index.json), or a Hugging Face model stub such as
+"meta-llama/Llama-3.2-1B-Instruct". Hub models are inspected over HTTP:
+only the index and each shard's JSON header are fetched, so the weights are
+never downloaded (requires huggingface_hub).
 """
 
 import argparse
 import json
 import re
 import struct
+import urllib.request
 from pathlib import Path
 
 # Same "dot-delimited integer" pattern the transformers loader uses to build
@@ -66,6 +73,10 @@ def parse_header(path: Path):
     with open(path, "rb") as f:
         (header_len,) = struct.unpack("<Q", f.read(8))
         header = json.loads(f.read(header_len))
+    yield from _parse_header(header)
+
+
+def _parse_header(header):
     for name, meta in header.items():
         if name == "__metadata__":
             continue
@@ -75,6 +86,68 @@ def parse_header(path: Path):
         for dim in shape:
             elems *= dim
         yield name, shape, dtype, elems * _DTYPE_BYTES[dtype]
+
+
+def _resolve_hub_files(model_id: str):
+    """List safetensors shard filenames of a Hub model without downloading.
+
+    Returns (repo_id, revision, [shard names]). Raises ValueError if the
+    model does not exist on the Hub.
+    """
+    try:
+        from huggingface_hub import hf_hub_url, list_repo_files
+        from huggingface_hub.utils import (
+            EntryNotFoundError,
+            RepositoryNotFoundError,
+            RevisionNotFoundError,
+        )
+    except ImportError as e:
+        raise ImportError(
+            "huggingface_hub is required to inspect Hub models; "
+            "pip install huggingface_hub"
+        ) from e
+
+    model_id = model_id.rstrip("/")
+    if "@" in model_id:
+        model_id, revision = model_id.split("@", 1)
+    else:
+        revision = None
+
+    try:
+        files = list_repo_files(repo_id=model_id, revision=revision)
+    except (RepositoryNotFoundError, RevisionNotFoundError) as e:
+        raise ValueError(f"{model_id}: model not found on the Hugging Face Hub") from e
+
+    shards = [f for f in files if f.endswith(".safetensors")]
+    if "model.safetensors.index.json" in files:
+        url = hf_hub_url(repo_id=model_id, revision=revision,
+                         filename="model.safetensors.index.json")
+        with urllib.request.urlopen(url) as r:
+            weight_map = json.load(r)["weight_map"]
+        shard_names = sorted(set(weight_map.values()))
+    elif shards:
+        shard_names = shards
+    else:
+        raise ValueError(f"{model_id}: no safetensors files on the Hub")
+
+    return model_id, revision, shard_names
+
+
+def fetch_hub_headers(model_id: str, revision, shard_names):
+    """Yield (name, shape, dtype, nbytes) per tensor across Hub shards.
+
+    Only each file's index and JSON header are fetched over HTTP; the tensor
+    data is never requested.
+    """
+    from huggingface_hub import hf_hub_url
+
+    for shard in shard_names:
+        url = hf_hub_url(repo_id=model_id, revision=revision,
+                         filename=shard)
+        with urllib.request.urlopen(url) as r:
+            (header_len,) = struct.unpack("<Q", r.read(8))
+            header = json.loads(r.read(header_len))
+        yield from _parse_header(header)
 
 
 def merged_rows(rows):
@@ -113,26 +186,39 @@ def print_table(headers, widths, body):
         print("  ".join(f"{v:<{w}}" for v, w in zip(line, widths)))
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Inspect safetensors model metadata")
-    parser.add_argument("model_dir", type=Path)
-    args = parser.parse_args()
-
-    index_path = args.model_dir / "model.safetensors.index.json"
+def _rows_from_dir(model_dir: Path):
+    index_path = model_dir / "model.safetensors.index.json"
     if index_path.exists():
         with open(index_path) as f:
             shard_names = sorted(set(json.load(f)["weight_map"].values()))
-        files = [args.model_dir / s for s in shard_names]
+        files = [model_dir / s for s in shard_names]
     else:
-        files = sorted(args.model_dir.glob("*.safetensors"))
+        files = sorted(model_dir.glob("*.safetensors"))
 
-    if not files:
-        print("No safetensors files found.")
-        return
-
-    rows = []
     for f in files:
-        rows.extend(parse_header(f))
+        yield from parse_header(f)
+
+
+def _rows_from_hub(model_id: str):
+    model_id, revision, shard_names = _resolve_hub_files(model_id)
+    return fetch_hub_headers(model_id, revision, shard_names)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Inspect safetensors model metadata",
+        epilog="MODEL is a local directory or a Hugging Face model stub "
+               "such as meta-llama/Llama-3.2-1B-Instruct",
+    )
+    parser.add_argument("model", metavar="MODEL",
+                        help="model directory or Hugging Face model stub")
+    args = parser.parse_args()
+
+    model_path = Path(args.model)
+    if model_path.is_dir():
+        rows = list(_rows_from_dir(model_path))
+    else:
+        rows = list(_rows_from_hub(args.model))
 
     #name_w = max(len(r[0]) for r in rows)
     #shape_w = max(len(str(r[1])) for r in rows)
@@ -140,6 +226,10 @@ def main():
     #body = [(name, str(shape), dtype) for name, shape, dtype, _ in rows]
     #print_table(["Name", "Shape", "Dtype"], [name_w, shape_w, dtype_w], body)
     #print(f"\nTotal: {len(rows)} tensors")
+
+    if not rows:
+        print("No safetensors files found.")
+        return
 
     print()
     merged = merged_rows(rows)
