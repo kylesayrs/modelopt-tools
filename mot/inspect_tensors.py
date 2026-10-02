@@ -11,9 +11,10 @@ never touched, so this stays fast even for very large models.
 
 The model may be a local directory of *.safetensors files (with or without a
 model.safetensors.index.json), or a Hugging Face model stub such as
-"meta-llama/Llama-3.2-1B-Instruct". Hub models are inspected over HTTP:
-only the index and each shard's JSON header are fetched, so the weights are
-never downloaded (requires huggingface_hub).
+"meta-llama/Llama-3.2-1B-Instruct". Hub models already downloaded to the
+local HF cache are inspected from the cached files; otherwise only the
+index and each shard's JSON header are fetched over HTTP, so the weights
+are never downloaded (requires huggingface_hub).
 """
 
 import argparse
@@ -95,24 +96,13 @@ def _resolve_hub_files(model_id: str):
     Returns (repo_id, revision, [shard names]). Raises ValueError if the
     model does not exist on the Hub.
     """
-    try:
-        from huggingface_hub import hf_hub_url, list_repo_files
-        from huggingface_hub.utils import (
-            EntryNotFoundError,
-            RepositoryNotFoundError,
-            RevisionNotFoundError,
-        )
-    except ImportError as e:
-        raise ImportError(
-            "huggingface_hub is required to inspect Hub models; "
-            "pip install huggingface_hub"
-        ) from e
+    from huggingface_hub import hf_hub_url, list_repo_files
+    from huggingface_hub.utils import (
+        RepositoryNotFoundError,
+        RevisionNotFoundError,
+    )
 
-    model_id = model_id.rstrip("/")
-    if "@" in model_id:
-        model_id, revision = model_id.split("@", 1)
-    else:
-        revision = None
+    model_id, revision = _split_model_id(model_id)
 
     try:
         files = list_repo_files(repo_id=model_id, revision=revision)
@@ -149,6 +139,35 @@ def fetch_hub_headers(model_id: str, revision, shard_names):
             (header_len,) = struct.unpack("<Q", r.read(8))
             header = json.loads(r.read(header_len))
         yield from _parse_header(header)
+
+
+def _split_model_id(model_id: str):
+    model_id = model_id.rstrip("/")
+    if "@" in model_id:
+        model_id, revision = model_id.split("@", 1)
+    else:
+        revision = None
+    return model_id, revision
+
+
+def _cached_snapshot_dir(model_id: str, revision):
+    """Return the snapshot directory if the model is in the local HF cache.
+
+    Uses huggingface_hub.try_to_load_from_cache to resolve model.safetensors
+    (or the index for sharded models) without any network access, then
+    returns the snapshot directory containing it. Returns None when the
+    model (or a complete snapshot) is not cached.
+    """
+    from huggingface_hub import try_to_load_from_cache
+
+    for filename in ("model.safetensors", "model.safetensors.index.json"):
+        path = try_to_load_from_cache(model_id, filename, revision=revision)
+        if isinstance(path, str):
+            snapshot_dir = Path(path).parent
+            if _rows_from_dir(snapshot_dir) and list(snapshot_dir.glob("*.safetensors")):
+                return snapshot_dir
+            break
+    return None
 
 
 def merged_rows(rows):
@@ -201,6 +220,19 @@ def _rows_from_dir(model_dir: Path):
 
 
 def _rows_from_hub(model_id: str):
+    """Read tensor rows for a Hub model, preferring the local HF cache.
+
+    If the model is already downloaded to the local Hugging Face cache, the
+    cached snapshot files are used directly. Otherwise the model is
+    inspected over HTTP, fetching only the index and each shard's JSON
+    header so the weights are never downloaded.
+    """
+    model_id, revision = _split_model_id(model_id)
+
+    snapshot_dir = _cached_snapshot_dir(model_id, revision)
+    if snapshot_dir is not None:
+        return _rows_from_dir(snapshot_dir)
+
     model_id, revision, shard_names = _resolve_hub_files(model_id)
     return fetch_hub_headers(model_id, revision, shard_names)
 
