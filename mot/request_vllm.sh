@@ -8,7 +8,7 @@ PORT="${1:?Usage: request_vllm.sh <port>}"
 curl "http://localhost:${PORT}/v1/chat/completions" \
     -H "Content-Type: application/json" \
     -d '{
-    "model": "dsv4_ct",
+    "model": "",
     "messages": [
         {"role": "user", "content": "Explain quantum computing."}
     ],
